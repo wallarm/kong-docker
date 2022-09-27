@@ -6,41 +6,41 @@ local Router       = require "kong.router"
 local balancer     = require "kong.runloop.balancer"
 local reports      = require "kong.reports"
 local constants    = require "kong.constants"
-local singletons   = require "kong.singletons"
 local certificate  = require "kong.runloop.certificate"
 local concurrency  = require "kong.concurrency"
-local declarative  = require "kong.db.declarative"
 local workspaces   = require "kong.workspaces"
 local lrucache     = require "resty.lrucache"
+local marshall     = require "kong.cache.marshall"
 
 
 local PluginsIterator = require "kong.runloop.plugins_iterator"
+local instrumentation = require "kong.tracing.instrumentation"
 
 
-local kong         = kong
-local type         = type
-local ipairs       = ipairs
-local tostring     = tostring
-local tonumber     = tonumber
-local setmetatable = setmetatable
-local sub          = string.sub
-local byte         = string.byte
-local gsub         = string.gsub
-local find         = string.find
-local lower        = string.lower
-local fmt          = string.format
-local ngx          = ngx
-local var          = ngx.var
-local log          = ngx.log
-local exit         = ngx.exit
-local exec         = ngx.exec
-local header       = ngx.header
-local timer_at     = ngx.timer.at
-local subsystem    = ngx.config.subsystem
-local clear_header = ngx.req.clear_header
-local http_version = ngx.req.http_version
-local unpack       = unpack
-local escape       = require("kong.tools.uri").escape
+local kong              = kong
+local type              = type
+local ipairs            = ipairs
+local tostring          = tostring
+local tonumber          = tonumber
+local setmetatable      = setmetatable
+local sub               = string.sub
+local byte              = string.byte
+local gsub              = string.gsub
+local find              = string.find
+local lower             = string.lower
+local fmt               = string.format
+local ngx               = ngx
+local var               = ngx.var
+local log               = ngx.log
+local exit              = ngx.exit
+local exec              = ngx.exec
+local header            = ngx.header
+local timer_at          = ngx.timer.at
+local subsystem         = ngx.config.subsystem
+local clear_header      = ngx.req.clear_header
+local http_version      = ngx.req.http_version
+local unpack            = unpack
+local escape            = require("kong.tools.uri").escape
 
 
 local is_http_module   = subsystem == "http"
@@ -71,7 +71,7 @@ local TTL_ZERO = { ttl = 0 }
 
 local ROUTER_SYNC_OPTS
 local PLUGINS_ITERATOR_SYNC_OPTS
-local FLIP_CONFIG_OPTS
+local RECONFIGURE_OPTS
 local GLOBAL_QUERY_OPTS = { workspace = ngx.null, show_ws_id = true }
 
 
@@ -215,8 +215,8 @@ local function register_balancer_events(core_cache, worker_events, cluster_event
     local target = data.entity
     -- => to worker_events node handler
     local ok, err = worker_events.post("balancer", "targets", {
-        operation = data.operation,
-        entity = data.entity,
+        operation = operation,
+        entity = target,
       })
     if not ok then
       log(ERR, "failed broadcasting target ",
@@ -287,15 +287,15 @@ local function register_balancer_events(core_cache, worker_events, cluster_event
     local operation = data.operation
     local upstream = data.entity
     local ws_id = workspaces.get_workspace_id()
-    if not data.entity.ws_id then
+    if not upstream.ws_id then
       log(DEBUG, "Event crud ", operation, " for upstream ", upstream.id,
           " received without ws_id, adding.")
-      data.entity.ws_id = ws_id
+      upstream.ws_id = ws_id
     end
     -- => to worker_events node handler
     local ok, err = worker_events.post("balancer", "upstreams", {
-        operation = data.operation,
-        entity = data.entity,
+        operation = operation,
+        entity = upstream,
       })
     if not ok then
       log(ERR, "failed broadcasting upstream ",
@@ -315,8 +315,8 @@ local function register_balancer_events(core_cache, worker_events, cluster_event
     local operation = data.operation
     local upstream = data.entity
 
-    if not data.entity.ws_id then
-      log(CRIT, "Operation ", operation, " for upstream ", data.entity.id,
+    if not upstream.ws_id then
+      log(CRIT, "Operation ", operation, " for upstream ", upstream.id,
           " received without workspace, discarding.")
       return
     end
@@ -365,7 +365,7 @@ local function register_events()
 
     worker_events.register(function(data)
       if ngx.worker.exiting() then
-        log(NOTICE, "declarative flip config canceled: process exiting")
+        log(NOTICE, "declarative reconfigure canceled: process exiting")
         return true
       end
 
@@ -381,14 +381,14 @@ local function register_events()
         balancer_hash = data[4]
       end
 
-      local ok, err = concurrency.with_coroutine_mutex(FLIP_CONFIG_OPTS, function()
+      local ok, err = concurrency.with_coroutine_mutex(RECONFIGURE_OPTS, function()
         local rebuild_balancer = balancer_hash == nil or balancer_hash ~= current_balancer_hash
         if rebuild_balancer then
           balancer.stop_healthcheckers(CLEAR_HEALTH_STATUS_DELAY)
         end
 
-        kong.cache:flip()
-        core_cache:flip()
+        kong.core_cache:purge()
+        kong.cache:purge()
 
         kong.default_workspace = default_ws
         ngx.ctx.workspace = kong.default_workspace
@@ -408,22 +408,18 @@ local function register_events()
           current_balancer_hash = balancer_hash
         end
 
-        declarative.lock()
-
         return true
       end)
 
       if not ok then
-        log(ERR, "config flip failed: ", err)
+        log(ERR, "reconfigure failed: ", err)
       end
-    end, "declarative", "flip_config")
+    end, "declarative", "reconfigure")
 
     return
   end
 
-
   -- events dispatcher
-
 
   worker_events.register(function(data)
     if not data.schema then
@@ -530,27 +526,7 @@ local function register_events()
     end
   end, "crud", "snis")
 
-
-  worker_events.register(function(data)
-    log(DEBUG, "[events] SSL cert updated, invalidating cached certificates")
-    local certificate = data.entity
-
-    for sni, err in db.snis:each_for_certificate({ id = certificate.id }, nil, GLOBAL_QUERY_OPTS) do
-      if err then
-        log(ERR, "[events] could not find associated snis for certificate: ",
-          err)
-        break
-      end
-
-      local cache_key = "certificates:" .. sni.certificate.id
-      core_cache:invalidate(cache_key)
-    end
-  end, "crud", "certificates")
-
-
-  if kong.configuration.role ~= "control_plane" then
-    register_balancer_events(core_cache, worker_events, cluster_events)
-  end
+  register_balancer_events(core_cache, worker_events, cluster_events)
 end
 
 
@@ -646,10 +622,17 @@ end
 
 
 do
+  local max  = math.max
+  local min  = math.min
+  local ceil = math.ceil
+
+  local DEFAULT_MATCH_LRUCACHE_SIZE = Router.DEFAULT_MATCH_LRUCACHE_SIZE
+
   local router
   local router_version
-  local router_cache = lrucache.new(Router.MATCH_LRUCACHE_SIZE)
-  local router_cache_neg = lrucache.new(Router.MATCH_LRUCACHE_SIZE)
+  local router_cache_size = DEFAULT_MATCH_LRUCACHE_SIZE
+  local router_cache = lrucache.new(router_cache_size)
+  local router_cache_neg = lrucache.new(router_cache_size)
 
 
   -- Given a protocol, return the subsystem that handles it
@@ -709,13 +692,13 @@ do
     local err
 
     -- kong.core_cache is available, not in init phase
-    if kong.core_cache then
+    if kong.core_cache and db.strategy ~= "off" then
       local cache_key = db.services:cache_key(service_pk.id, nil, nil, nil, nil,
                                               route.ws_id)
       service, err = kong.core_cache:get(cache_key, TTL_ZERO,
                                     load_service_from_db, service_pk)
 
-    else -- init phase, kong.core_cache not available
+    else -- dbless or init phase: kong.core_cache not needed/available
 
       -- A new service/route has been inserted while the initial route
       -- was being created, on init (perhaps by a different Kong node).
@@ -774,8 +757,8 @@ do
         return nil, "could not load routes: " .. err
       end
 
-      if db.strategy ~= "off" then
-        if kong.core_cache and counter > 0 and counter % page_size == 0 then
+      if db.strategy ~= "off" and kong.core_cache then
+        if counter > 0 and counter % page_size == 0 then
           local new_version, err = get_router_version()
           if err then
             return nil, "failed to retrieve router version: " .. err
@@ -785,6 +768,7 @@ do
             return nil, "router was changed while rebuilding it"
           end
         end
+        counter = counter + 1
       end
 
       if should_process_route(route) then
@@ -805,11 +789,17 @@ do
           routes[i] = r
         end
       end
-
-      counter = counter + 1
     end
 
-    local new_router, err = Router.new(routes, router_cache, router_cache_neg)
+    local n = DEFAULT_MATCH_LRUCACHE_SIZE
+    local cache_size = min(ceil(max(i / n, 1)) * n, n * 20)
+
+    if cache_size ~= router_cache_size then
+      router_cache = lrucache.new(cache_size)
+      router_cache_size = cache_size
+    end
+
+    local new_router, err = Router.new(routes, router_cache, router_cache_neg, router)
     if not new_router then
       return nil, "could not create router: " .. err
     end
@@ -822,10 +812,6 @@ do
 
     router_cache:flush_all()
     router_cache_neg:flush_all()
-
-    -- LEGACY - singletons module is deprecated
-    singletons.router = router
-    -- /LEGACY
 
     return true
   end
@@ -954,7 +940,6 @@ do
     ctx.service          = service
     ctx.route            = route
     ctx.balancer_data    = balancer_data
-    ctx.balancer_address = balancer_data -- for plugin backward compatibility
 
     if is_http_module and service then
       local res, err
@@ -1033,17 +1018,24 @@ end
 
 
 local function set_init_versions_in_cache()
-  if kong.configuration.role ~= "control_pane" then
-    local ok, err = kong.core_cache:safe_set("router:version", "init")
-    if not ok then
-      return nil, "failed to set router version in cache: " .. tostring(err)
-    end
+  -- because of worker events, kong.cache can not be initialized in `init` phase
+  -- therefore, we need to use the shdict API directly to set the initial value
+  assert(kong.configuration.role ~= "control_plane")
+  assert(ngx.get_phase() == "init")
+  local core_cache_shm = ngx.shared["kong_core_db_cache"]
+
+  -- ttl = forever is okay as "*:versions" keys are always manually invalidated
+  local marshalled_value = marshall("init", 0, 0)
+
+  -- see kong.cache.safe_set function
+  local ok, err = core_cache_shm:safe_set("kong_core_db_cacherouter:version", marshalled_value)
+  if not ok then
+    return nil, "failed to set initial router version in cache: " .. tostring(err)
   end
 
-  local ok, err = kong.core_cache:safe_set("plugins_iterator:version", "init")
+  ok, err = core_cache_shm:safe_set("kong_core_db_cacheplugins_iterator:version", marshalled_value)
   if not ok then
-    return nil, "failed to set plugins iterator version in cache: " ..
-                tostring(err)
+    return nil, "failed to set initial plugins iterator version in cache: " .. tostring(err)
   end
 
   return true
@@ -1086,11 +1078,11 @@ return {
 
       update_lua_mem(true)
 
-      register_events()
-
       if kong.configuration.role == "control_plane" then
         return
       end
+
+      register_events()
 
       -- initialize balancers for active healthchecks
       timer_at(0, function()
@@ -1111,8 +1103,8 @@ return {
         end
 
         if strategy == "off" then
-          FLIP_CONFIG_OPTS = {
-            name = "flip-config",
+          RECONFIGURE_OPTS = {
+            name = "reconfigure",
             timeout = rebuild_timeout,
           }
         end
@@ -1154,14 +1146,11 @@ return {
           if not ok then
             log(ERR, "could not rebuild router via timer: ", err)
           end
-
-          local _, err = timer_at(worker_state_update_frequency, rebuild_router_timer)
-          if err then
-            log(ERR, "could not schedule timer to rebuild router: ", err)
-          end
         end
 
-        local _, err = timer_at(worker_state_update_frequency, rebuild_router_timer)
+        local _, err = kong.timer:named_every("router-rebuild",
+                                         worker_state_update_frequency,
+                                         rebuild_router_timer)
         if err then
           log(ERR, "could not schedule timer to rebuild router: ", err)
         end
@@ -1181,14 +1170,11 @@ return {
           if err then
             log(ERR, "could not rebuild plugins iterator via timer: ", err)
           end
-
-          local _, err = timer_at(worker_state_update_frequency, rebuild_plugins_iterator_timer)
-          if err then
-            log(ERR, "could not schedule timer to rebuild plugins iterator: ", err)
-          end
         end
 
-        local _, err = timer_at(worker_state_update_frequency, rebuild_plugins_iterator_timer)
+        local _, err = kong.timer:named_every("plugins-iterator-rebuild",
+                                         worker_state_update_frequency,
+                                         rebuild_plugins_iterator_timer)
         if err then
           log(ERR, "could not schedule timer to rebuild plugins iterator: ", err)
         end
@@ -1210,7 +1196,7 @@ return {
 
       local router = get_updated_router()
 
-      local match_t = router.exec(ctx)
+      local match_t = router:exec(ctx)
       if not match_t then
         log(ERR, "no Route found with those values")
         return exit(500)
@@ -1261,6 +1247,7 @@ return {
     before = function(ctx)
       local server_port = var.server_port
       ctx.host_port = HOST_PORTS[server_port] or server_port
+      instrumentation.request(ctx)
     end,
     after = NOOP,
   },
@@ -1277,11 +1264,25 @@ return {
       ctx.scheme = var.scheme
       ctx.request_uri = var.request_uri
 
+      -- trace router
+      local span = instrumentation.router()
+
       -- routing request
       local router = get_updated_router()
-      local match_t = router.exec(ctx)
+      local match_t = router:exec(ctx)
       if not match_t then
+        -- tracing
+        if span then
+          span:set_status(2)
+          span:finish()
+        end
+
         return kong.response.exit(404, { message = "no Route matched with those values" })
+      end
+
+      -- ends tracing span
+      if span then
+        span:finish()
       end
 
       ctx.workspace = match_t.route and match_t.route.ws_id
@@ -1446,7 +1447,9 @@ return {
       var.wallarm_parse_response = wallarm_ngx_boolean(route.wallarm_parse_response)
       var.wallarm_parse_websocket = wallarm_ngx_boolean(route.wallarm_parse_websocket)
       var.wallarm_unpack_response = wallarm_ngx_boolean(route.wallarm_unpack_response)
-      var.wallarm_partner_client_uuid = route.wallarm_partner_client_uuid
+      if route.wallarm_partner_client_uuid ~= nil then
+        var.wallarm_partner_client_uuid = route.wallarm_partner_client_uuid
+      end
 
       -- At this point, the router and `balancer_setup_stage1` have been
       -- executed; detect requests that need to be redirected from `proxy_pass`
@@ -1482,7 +1485,7 @@ return {
       if byte(ctx.request_uri or var.request_uri, -1) == QUESTION_MARK then
         var.upstream_uri = var.upstream_uri .. "?"
       elseif var.is_args == "?" then
-        var.upstream_uri = var.upstream_uri .. "?" .. var.args or ""
+        var.upstream_uri = var.upstream_uri .. "?" .. (var.args or "")
       end
 
       local upstream_scheme = var.upstream_scheme
@@ -1525,25 +1528,39 @@ return {
       end
 
       -- clear hop-by-hop request headers:
-      for _, header_name in csv(var.http_connection) do
-        -- some of these are already handled by the proxy module,
-        -- upgrade being an exception that is handled below with
-        -- special semantics.
-        if header_name == "upgrade" then
-          if var.upstream_connection == "keep-alive" then
+      local http_connection = var.http_connection
+      if http_connection ~= "keep-alive" and
+         http_connection ~= "close"      and
+         http_connection ~= "upgrade"
+      then
+        for _, header_name in csv(http_connection) do
+          -- some of these are already handled by the proxy module,
+          -- upgrade being an exception that is handled below with
+          -- special semantics.
+          if header_name == "upgrade" then
+            if var.upstream_connection == "keep-alive" then
+              clear_header(header_name)
+            end
+
+          else
             clear_header(header_name)
           end
-
-        else
-          clear_header(header_name)
         end
       end
 
       -- add te header only when client requests trailers (proxy removes it)
-      for _, header_name in csv(var.http_te) do
-        if header_name == "trailers" then
+      local http_te = var.http_te
+      if http_te then
+        if http_te == "trailers" then
           var.upstream_te = "trailers"
-          break
+
+        else
+          for _, header_name in csv(http_te) do
+            if header_name == "trailers" then
+              var.upstream_te = "trailers"
+              break
+            end
+          end
         end
       end
 
@@ -1567,9 +1584,15 @@ return {
       end
 
       -- clear hop-by-hop response headers:
-      for _, header_name in csv(var.upstream_http_connection) do
-        if header_name ~= "close" and header_name ~= "upgrade" and header_name ~= "keep-alive" then
-          header[header_name] = nil
+      local upstream_http_connection = var.upstream_http_connection
+      if upstream_http_connection ~= "keep-alive" and
+         upstream_http_connection ~= "close"      and
+         upstream_http_connection ~= "upgrade"
+      then
+        for _, header_name in csv(upstream_http_connection) do
+          if header_name ~= "close" and header_name ~= "upgrade" and header_name ~= "keep-alive" then
+            header[header_name] = nil
+          end
         end
       end
 
@@ -1584,7 +1607,7 @@ return {
       end
 
       local upstream_status_header = constants.HEADERS.UPSTREAM_STATUS
-      if singletons.configuration.enabled_headers[upstream_status_header] then
+      if kong.configuration.enabled_headers[upstream_status_header] then
         header[upstream_status_header] = tonumber(sub(var.upstream_status or "", -3))
         if not header[upstream_status_header] then
           log(ERR, "failed to set ", upstream_status_header, " header")
@@ -1645,8 +1668,12 @@ return {
     end
   },
   log = {
-    before = NOOP,
+    before = function(ctx)
+      instrumentation.runloop_log_before(ctx)
+    end,
     after = function(ctx)
+      instrumentation.runloop_log_after(ctx)
+
       update_lua_mem()
 
       if kong.configuration.anonymous_reports then
