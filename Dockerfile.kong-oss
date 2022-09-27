@@ -1,4 +1,4 @@
-FROM kong:2.7-ubuntu
+FROM kong:2.8-ubuntu
 LABEL maintainer "Wallarm Support Team <support@wallarm.com>"
 
 ENV DEBIAN_FRONTEND noninteractive
@@ -11,7 +11,7 @@ RUN printf -- "mQINBGIMrcABEAC6Eiq7wvDFie+y6P8e8rRxXlmpOh7FP4NwyR+XAoANbztuZMZO2
     && apt-get -y update && apt-get -y upgrade \
     && apt-get -y --no-install-recommends install \
         curl \
-        kong27-module-wallarm \
+        kong28-module-wallarm \
     && sed -i "s|listen 127.0.0.8:80|listen 127.0.0.1:10246|g" /etc/kong/nginx-wallarm.template \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* \

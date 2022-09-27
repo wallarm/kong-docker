@@ -1,5 +1,5 @@
 local typedefs = require "kong.db.schema.typedefs"
-local Schema = require "kong.db.schema"
+
 
 return {
   name         = "routes",
@@ -55,11 +55,11 @@ return {
     { tags             = typedefs.tags },
     { service = { type = "foreign", reference = "services" }, },
     -- Wallarm options:
-    { wallarm_mode = { type = "string", default = "off", one_of = { "off", "monitoring", "safe_blocking", "block" }, }, },
-    { wallarm_application = { type = "integer", between = { 1, 2 ^ 31 }, }, },
-    { wallarm_parse_response = { type = "boolean", default = false }, },
-    { wallarm_parse_websocket = { type = "boolean", default = false }, },
-    { wallarm_unpack_response = { type = "boolean", default = false }, },
+    { wallarm_mode                = { type = "string", default = "off", one_of = { "off", "monitoring", "safe_blocking", "block" }, }, },
+    { wallarm_application         = { type = "integer", between = { 1, 2 ^ 31 }, }, },
+    { wallarm_parse_response      = { type = "boolean", default = false }, },
+    { wallarm_parse_websocket     = { type = "boolean", default = false }, },
+    { wallarm_unpack_response     = { type = "boolean", default = false }, },
     { wallarm_partner_client_uuid = typedefs.uuid { auto = false, }, },
   },
 

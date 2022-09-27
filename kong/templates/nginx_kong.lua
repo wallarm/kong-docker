@@ -61,7 +61,6 @@ init_worker_by_lua_block {
 lua_kong_load_var_index $args;
 lua_kong_load_var_index $bytes_sent;
 lua_kong_load_var_index $content_type;
-lua_kong_load_var_index $ctx_ref;
 lua_kong_load_var_index $host;
 lua_kong_load_var_index $http_authorization;
 lua_kong_load_var_index $http_connection;
@@ -80,7 +79,6 @@ lua_kong_load_var_index $http_x_forwarded_proto;
 lua_kong_load_var_index $https;
 lua_kong_load_var_index $http2;
 lua_kong_load_var_index $is_args;
-lua_kong_load_var_index $kong_proxy_mode;
 lua_kong_load_var_index $realip_remote_addr;
 lua_kong_load_var_index $realip_remote_port;
 lua_kong_load_var_index $remote_addr;
@@ -98,22 +96,10 @@ lua_kong_load_var_index $ssl_client_raw_cert;
 lua_kong_load_var_index $ssl_client_verify;
 lua_kong_load_var_index $ssl_protocol;
 lua_kong_load_var_index $ssl_server_name;
-lua_kong_load_var_index $upstream_connection;
-lua_kong_load_var_index $upstream_host;
 lua_kong_load_var_index $upstream_http_connection;
 lua_kong_load_var_index $upstream_http_trailer;
 lua_kong_load_var_index $upstream_http_upgrade;
-lua_kong_load_var_index $upstream_scheme;
 lua_kong_load_var_index $upstream_status;
-lua_kong_load_var_index $upstream_te;
-lua_kong_load_var_index $upstream_uri;
-lua_kong_load_var_index $upstream_upgrade;
-lua_kong_load_var_index $upstream_x_forwarded_for;
-lua_kong_load_var_index $upstream_x_forwarded_host;
-lua_kong_load_var_index $upstream_x_forwarded_path;
-lua_kong_load_var_index $upstream_x_forwarded_port;
-lua_kong_load_var_index $upstream_x_forwarded_prefix;
-lua_kong_load_var_index $upstream_x_forwarded_proto;
 
 upstream kong_upstream {
     server 0.0.0.1;
@@ -198,7 +184,6 @@ server {
         set $kong_proxy_mode             'http';
 
         set $wallarm_mode                'off';
-        set $wallarm_fallback            'off';
         set $wallarm_application         '';
         set $wallarm_parse_response      'off';
         set $wallarm_parse_websocket     'off';
@@ -242,8 +227,13 @@ server {
         internal;
         default_type         '';
         set $kong_proxy_mode 'unbuffered';
-        set $wallarm_mode 'off';
-        wallarm_mode $wallarm_mode;
+
+        wallarm_mode                $wallarm_mode;
+        wallarm_application         $wallarm_application;
+        wallarm_parse_response      $wallarm_parse_response;
+        wallarm_parse_websocket     $wallarm_parse_websocket;
+        wallarm_unpack_response     $wallarm_unpack_response;
+        wallarm_partner_client_uuid $wallarm_partner_client_uuid;
 
         proxy_http_version      1.1;
         proxy_buffering         off;
@@ -275,8 +265,13 @@ server {
         internal;
         default_type         '';
         set $kong_proxy_mode 'unbuffered';
-        set $wallarm_mode 'off';
-        wallarm_mode $wallarm_mode;
+
+        wallarm_mode                $wallarm_mode;
+        wallarm_application         $wallarm_application;
+        wallarm_parse_response      $wallarm_parse_response;
+        wallarm_parse_websocket     $wallarm_parse_websocket;
+        wallarm_unpack_response     $wallarm_unpack_response;
+        wallarm_partner_client_uuid $wallarm_partner_client_uuid;
 
         proxy_http_version      1.1;
         proxy_buffering          on;
@@ -308,8 +303,13 @@ server {
         internal;
         default_type         '';
         set $kong_proxy_mode 'unbuffered';
-        set $wallarm_mode 'off';
-        wallarm_mode $wallarm_mode;
+
+        wallarm_mode                $wallarm_mode;
+        wallarm_application         $wallarm_application;
+        wallarm_parse_response      $wallarm_parse_response;
+        wallarm_parse_websocket     $wallarm_parse_websocket;
+        wallarm_unpack_response     $wallarm_unpack_response;
+        wallarm_partner_client_uuid $wallarm_partner_client_uuid;
 
         proxy_http_version      1.1;
         proxy_buffering         off;
@@ -341,8 +341,13 @@ server {
         internal;
         default_type         '';
         set $kong_proxy_mode 'grpc';
-        set $wallarm_mode 'off';
-        wallarm_mode $wallarm_mode;
+
+        wallarm_mode                $wallarm_mode;
+        wallarm_application         $wallarm_application;
+        wallarm_parse_response      $wallarm_parse_response;
+        wallarm_parse_websocket     $wallarm_parse_websocket;
+        wallarm_unpack_response     $wallarm_unpack_response;
+        wallarm_partner_client_uuid $wallarm_partner_client_uuid;
 
         grpc_set_header      TE                 $upstream_te;
         grpc_set_header      X-Forwarded-For    $upstream_x_forwarded_for;
@@ -367,7 +372,13 @@ server {
         internal;
         default_type         '';
         set $kong_proxy_mode 'http';
-        set $wallarm_mode 'off';
+
+        wallarm_mode                $wallarm_mode;
+        wallarm_application         $wallarm_application;
+        wallarm_parse_response      $wallarm_parse_response;
+        wallarm_parse_websocket     $wallarm_parse_websocket;
+        wallarm_unpack_response     $wallarm_unpack_response;
+        wallarm_partner_client_uuid $wallarm_partner_client_uuid;
 
         rewrite_by_lua_block       {;}
         access_by_lua_block        {;}
