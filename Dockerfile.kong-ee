@@ -1,4 +1,4 @@
-FROM kong:2.7-ubuntu
+FROM kong:2.8-ubuntu
 LABEL maintainer "Wallarm Support Team <support@wallarm.com>"
 
 ENV DEBIAN_FRONTEND noninteractive
@@ -11,11 +11,11 @@ RUN printf -- "mQINBGIMrcABEAC6Eiq7wvDFie+y6P8e8rRxXlmpOh7FP4NwyR+XAoANbztuZMZO2
     && apt-get -y update && apt-get -y upgrade \
     && apt-get -y remove kong \
     && apt-get -y --no-install-recommends install wget \
-    && wget -O /tmp/kong-ee.deb -q https://download.konghq.com/gateway-2.x-ubuntu-focal/pool/all/k/kong-enterprise-edition/kong-enterprise-edition_2.7.2.0_all.deb \
+    && wget -O /tmp/kong-ee.deb -q https://download.konghq.com/gateway-2.x-ubuntu-focal/pool/all/k/kong-enterprise-edition/kong-enterprise-edition_2.8.1.4_all.deb \
     && apt -y install /tmp/kong-ee.deb \
     && apt-get -y --no-install-recommends install \
         curl \
-        kong27-module-wallarm \
+        kong28-module-wallarm \
     && sed -i "s|listen 127.0.0.8:80|listen 127.0.0.1:10246|g" /etc/kong/nginx-wallarm.template \
     && apt-get -y remove wget \
     && apt-get clean \
