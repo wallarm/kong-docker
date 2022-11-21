@@ -1,1 +1,1 @@
-deb [signed-by=/usr/share/keyrings/wallarm-archive-keyring.gpg] http://repo.wallarm.com/ubuntu/wallarm-node focal/4.2/
+deb [signed-by=/usr/share/keyrings/wallarm-archive-keyring.gpg] http://repo.wallarm.com/ubuntu/wallarm-node focal/4.4/
