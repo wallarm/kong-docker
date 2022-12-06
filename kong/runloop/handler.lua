@@ -44,6 +44,7 @@ local clear_header      = ngx.req.clear_header
 local http_version      = ngx.req.http_version
 local unpack            = unpack
 local escape            = require("kong.tools.uri").escape
+local null              = ngx.null
 
 
 local is_http_module   = subsystem == "http"
@@ -65,12 +66,13 @@ local ERR   = ngx.ERR
 local CRIT  = ngx.CRIT
 local NOTICE = ngx.NOTICE
 local WARN  = ngx.WARN
+local INFO  = ngx.INFO
 local DEBUG = ngx.DEBUG
 local COMMA = byte(",")
 local SPACE = byte(" ")
 local QUESTION_MARK = byte("?")
 local ARRAY_MT = require("cjson.safe").array_mt
-
+local get_sys_filter_level = require("ngx.errlog").get_sys_filter_level
 
 local HOST_PORTS = {}
 
@@ -102,6 +104,7 @@ local set_upstream_ssl_verify
 local set_upstream_ssl_verify_depth
 local set_upstream_ssl_trusted_store
 local set_authority
+local set_log_level
 if is_http_module then
   local tls = require("resty.kong.tls")
   set_upstream_cert_and_key = tls.set_upstream_cert_and_key
@@ -109,6 +112,7 @@ if is_http_module then
   set_upstream_ssl_verify_depth = tls.set_upstream_ssl_verify_depth
   set_upstream_ssl_trusted_store = tls.set_upstream_ssl_trusted_store
   set_authority = require("resty.kong.grpc").set_authority
+  set_log_level = require("resty.kong.log").set_log_level
 end
 
 
@@ -703,12 +707,17 @@ local function register_events()
     local current_plugins_hash
     local current_balancer_hash
 
+    local now = ngx.now
+    local update_time = ngx.update_time
+    local worker_id = ngx.worker.id()
+
     local exiting = ngx.worker.exiting
     local function is_exiting()
       if not exiting() then
         return false
       end
-      log(NOTICE, "declarative reconfigure canceled: process exiting")
+      log(NOTICE, "declarative reconfigure was canceled on worker #", worker_id,
+                  ": process exiting")
       return true
     end
 
@@ -716,6 +725,11 @@ local function register_events()
       if is_exiting() then
         return true
       end
+
+      update_time()
+      local reconfigure_started_at = now() * 1000
+
+      log(INFO, "declarative reconfigure was started on worker #", worker_id)
 
       local default_ws
       local router_hash
@@ -734,6 +748,7 @@ local function register_events()
 
         local rebuild_balancer = balancer_hash == nil or balancer_hash ~= current_balancer_hash
         if rebuild_balancer then
+          log(DEBUG, "stopping previously started health checkers on worker #", worker_id)
           balancer.stop_healthcheckers(CLEAR_HEALTH_STATUS_DELAY)
         end
 
@@ -742,23 +757,40 @@ local function register_events()
 
         local router, err
         if router_hash == nil or router_hash ~= current_router_hash then
+          update_time()
+          local start = now() * 1000
+
           router, err = new_router()
           if not router then
             return nil, err
           end
+
+          update_time()
+          log(INFO, "building a new router took ",  now() * 1000 - start,
+                    " ms on worker #", worker_id)
         end
 
         local plugins_iterator
         if plugins_hash == nil or plugins_hash ~= current_plugins_hash then
+          update_time()
+          local start = now() * 1000
+
           plugins_iterator, err = new_plugins_iterator()
           if not plugins_iterator then
             return nil, err
           end
+
+          update_time()
+          log(INFO, "building a new plugins iterator took ", now() * 1000 - start,
+                    " ms on worker #", worker_id)
         end
 
         -- below you are not supposed to yield and this should be fast and atomic
 
         -- TODO: we should perhaps only purge the configuration related cache.
+
+        log(DEBUG, "flushing caches as part of the reconfiguration on worker #", worker_id)
+
         kong.core_cache:purge()
         kong.cache:purge()
 
@@ -777,15 +809,22 @@ local function register_events()
         if rebuild_balancer then
           -- TODO: balancer is a big blob of global state and you cannot easily
           --       initialize new balancer and then atomically flip it.
+          log(DEBUG, "reinitializing balancer with a new configuration on worker #", worker_id)
           balancer.init()
           current_balancer_hash = balancer_hash
         end
+
+        update_time()
+        log(INFO, "declarative reconfigure took ", now() * 1000 - reconfigure_started_at,
+                  " ms on worker #", worker_id)
 
         return true
       end)
 
       if not ok then
-        log(ERR, "reconfigure failed: ", err)
+        update_time()
+        log(ERR, "declarative reconfigure failed after ", now() * 1000 - reconfigure_started_at,
+                 " ms on worker #", worker_id, ": ", err)
       end
     end, "declarative", "reconfigure")
 
@@ -900,6 +939,31 @@ local function register_events()
   end, "crud", "snis")
 
   register_balancer_events(core_cache, worker_events, cluster_events)
+
+
+  -- Consumers invalidations
+  -- As we support conifg.anonymous to be configured as Consumer.username,
+  -- so add an event handler to invalidate the extra cache in case of data inconsistency
+  worker_events.register(function(data)
+    workspaces.set_workspace(data.workspace)
+
+    local old_entity = data.old_entity
+    local old_username
+    if old_entity then
+      old_username = old_entity.username
+      if old_username and old_username ~= null and old_username ~= "" then
+        kong.cache:invalidate(kong.db.consumers:cache_key(old_username))
+      end
+    end
+
+    local entity = data.entity
+    if entity then
+      local username = entity.username
+      if username and username ~= null and username ~= "" and username ~= old_username then
+        kong.cache:invalidate(kong.db.consumers:cache_key(username))
+      end
+    end
+  end, "crud", "consumers")
 end
 
 
@@ -1085,6 +1149,56 @@ return {
 
       STREAM_TLS_TERMINATE_SOCK = fmt("unix:%s/stream_tls_terminate.sock", prefix)
       STREAM_TLS_PASSTHROUGH_SOCK = fmt("unix:%s/stream_tls_passthrough.sock", prefix)
+
+      if is_http_module then
+        -- if worker has outdated log level (e.g. newly spawned), updated it
+        timer_at(0, function()
+          local cur_log_level = get_sys_filter_level()
+          local shm_log_level = ngx.shared.kong:get("kong:log_level")
+          if cur_log_level and shm_log_level and cur_log_level ~= shm_log_level then
+            local ok, err = pcall(set_log_level, shm_log_level)
+            if not ok then
+              local worker = ngx.worker.id()
+              log(ERR, "worker" , worker, " failed setting log level: ", err)
+            end
+          end
+        end)
+
+        -- log level cluster event updates
+        kong.cluster_events:subscribe("log_level", function(data)
+          log(NOTICE, "log level cluster event received")
+
+          if not data then
+            kong.log.err("received empty data in cluster_events subscription")
+            return
+          end
+
+          local ok, err = kong.worker_events.post("debug", "log_level", tonumber(data))
+
+          if not ok then
+            kong.log.err("failed broadcasting to workers: ", err)
+            return
+          end
+
+          log(NOTICE, "log level event posted for node")
+        end)
+
+        -- log level worker event updates
+        kong.worker_events.register(function(data)
+          local worker = ngx.worker.id()
+
+          log(NOTICE, "log level worker event received for worker ", worker)
+
+          local ok, err = pcall(set_log_level, data)
+
+          if not ok then
+            log(ERR, "worker ", worker, " failed setting log level: ", err)
+            return
+          end
+
+          log(NOTICE, "log level changed to ", data, " for worker ", worker)
+        end, "debug", "log_level")
+      end
 
       if kong.configuration.host_ports then
         HOST_PORTS = kong.configuration.host_ports
